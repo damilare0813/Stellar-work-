@@ -38,9 +38,14 @@ export function titleToBytesN64(title: string): Uint8Array {
   return padded;
 }
 
-export async function postJob(
+/**
+ * Build the ScVal arguments for `post_job`. Exported separately so the fee
+ * estimator can simulate the exact same transaction the form will submit.
+ */
+export function buildPostJobArgs(
   client: string,
   amount: string,
+  bonusAmount: string,
   descHashHex: string,
   descriptionPayloadLen: number,
   deadline: string,
@@ -48,16 +53,45 @@ export async function postJob(
   title: string,
   category: string,
 ) {
-  return callContract(getActiveContractId(), "post_job", [
+  return [
     nativeToScVal(client, { type: "address" }),
     nativeToScVal(amount, { type: "i128" }),
+    nativeToScVal(bonusAmount, { type: "i128" }),
     nativeToScVal(hexToBytes(descHashHex), { type: "bytes" }),
     nativeToScVal(descriptionPayloadLen, { type: "u32" }),
     nativeToScVal(deadline, { type: "u64" }),
     nativeToScVal(tokenAddress, { type: "address" }),
     nativeToScVal(titleToBytesN64(title), { type: "bytes" }),
     nativeToScVal(category, { type: "symbol" }),
-  ]);
+  ];
+}
+
+export async function postJob(
+  client: string,
+  amount: string,
+  bonusAmount: string,
+  descHashHex: string,
+  descriptionPayloadLen: number,
+  deadline: string,
+  tokenAddress: string,
+  title: string,
+  category: string,
+) {
+  return callContract(
+    getActiveContractId(),
+    "post_job",
+    buildPostJobArgs(
+      client,
+      amount,
+      bonusAmount,
+      descHashHex,
+      descriptionPayloadLen,
+      deadline,
+      tokenAddress,
+      title,
+      category,
+    ),
+  );
 }
 
 export async function getCompletedJobsCount(): Promise<number> {
@@ -391,6 +425,7 @@ export async function createJobWithMilestones(
   tokenAddress: string,
   title: string,
   category: string,
+  bonusAmount: string,
 ) {
   // Encode milestones as a Vec<MilestoneInput> — each element is a struct map.
   const encodedMilestones = xdr.ScVal.scvVec(
@@ -417,6 +452,7 @@ export async function createJobWithMilestones(
     nativeToScVal(tokenAddress, { type: "address" }),
     nativeToScVal(titleToBytesN64(title), { type: "bytes" }),
     nativeToScVal(category, { type: "symbol" }),
+    nativeToScVal(bonusAmount, { type: "i128" }),
   ]);
 }
 
@@ -623,6 +659,27 @@ export async function getJobStatusCounts(): Promise<JobStatusCounts> {
     disputed: 0,
     total: 0,
   };
+}
+
+/**
+ * Fetch the current platform fee rate in basis points (bps) from the contract.
+ * Returns null when the contract method is not available (e.g. older deployment),
+ * so callers can fall back to the hard-coded default of 250 bps (2.5 %).
+ */
+export async function getPlatformFeeRate(): Promise<number | null> {
+  try {
+    const response = await callContract(
+      getActiveContractId(),
+      "get_platform_fee",
+      [],
+      { readOnly: true },
+    );
+    const raw = response.data;
+    if (raw == null) return null;
+    return Number(raw);
+  } catch {
+    return null;
+  }
 }
 
 export async function relayCancelJob(relayer: string, client: string, jobId: string) {

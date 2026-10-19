@@ -11,6 +11,15 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_COMMIT_SHA: process.env.COMMIT_SHA ?? process.env.VERCEL_GIT_COMMIT_SHA ?? "",
     NEXT_PUBLIC_DEPLOY_ENV: process.env.DEPLOY_ENV ?? process.env.VERCEL_ENV ?? "development",
   },
+  images: {
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "**",
+      },
+    ],
+    dangerouslyAllowSVG: true,
+  },
   headers: async () => {
     const isReportOnly = process.env.CSP_REPORT_ONLY === "true";
     const cspHeaderKey = isReportOnly
@@ -38,6 +47,10 @@ const nextConfig: NextConfig = {
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "DENY" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=63072000; includeSubDomains; preload",
+          },
         ],
       },
       {

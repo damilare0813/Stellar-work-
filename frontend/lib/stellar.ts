@@ -29,6 +29,7 @@ import { recordRecentContractInteraction } from "@/lib/recent-contract-interacti
 import { classifyError, reportContractTx, reportRpcError } from "@/lib/metrics-client";
 import { describeContractError } from "./contract-errors";
 import { TransactionVerifier } from "@/lib/transaction-verifier";
+import { guardSigningRequest } from "@/lib/signing-origin-validator";
 import {
   decodeQueuedArgs,
   DEFAULT_RETRY_CONFIG,
@@ -285,6 +286,39 @@ async function submitWriteContract(
   args: xdr.ScVal[],
   options?: { pollTimeout?: number },
 ): Promise<TransactionResult> {
+  // ── Origin and network validation (wallet signing origin issue) ─────────
+  // Run before any RPC or wallet interaction so a bad state is caught early
+  // and surfaces a clear message rather than a cryptic Freighter or RPC error.
+  //
+  // • Network mismatch  → always throws (REJECT): the signed transaction would
+  //   target the wrong ledger and be invalid.
+  // • Unknown origin    → logs a console warning but does NOT throw (WARN):
+  //   the app is a browser SPA, so an unrecognised preview/staging URL should
+  //   not hard-block legitimate use. The SigningOriginWarning component in the
+  //   UI surfaces this state to the user before they confirm.
+  // • SSR / "unknown"   → always throws (REJECT): signing must happen in a
+  //   browser context only.
+  const appNetwork = getActiveNetwork();
+  const walletNetwork = await getWalletNetwork();
+  const guard = guardSigningRequest(appNetwork, walletNetwork);
+
+  if (!guard.allowed) {
+    throw new Error(guard.blockReason);
+  }
+
+  if (guard.originResult.decision === "WARN") {
+    // Non-blocking, but explicitly logged so security audits can trace it.
+    console.warn(
+      "[SigningOriginValidator] Signing request from unrecognised origin:",
+      {
+        origin: guard.originResult.origin,
+        method,
+        contractId: contractId.slice(0, 8) + "…",
+      },
+    );
+  }
+  // ────────────────────────────────────────────────────────────────────────
+
   const server = new rpc.Server(getRpcUrl());
   const networkPassphrase = getNetworkPassphrase();
   const contract = new Contract(contractId);
@@ -398,10 +432,26 @@ async function submitWriteContract(
           timestamp: Date.now(),
           method,
         });
+
+        let errorResult = "Transaction failed.";
+        if (txStatus.errorResultXdr) {
+          try {
+            const resultXdr = xdr.TransactionResult.fromXDR(txStatus.errorResultXdr, "base64");
+            const code = resultXdr.result().switch().name;
+            if (code === "txTooLate") {
+              errorResult = "timeout";
+            } else {
+              errorResult = `Transaction failed: ${code}`;
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+
         return {
           status: "ERROR",
           hash: sent.hash,
-          errorResult: "Transaction failed.",
+          errorResult,
         };
       }
     }
@@ -442,6 +492,16 @@ export function decodeScVal<T = unknown>(value: xdr.ScVal): T {
 }
 
 export { nativeToScVal, xdr };
+export {
+  guardSigningRequest,
+  validateSigningOrigin,
+  checkNetworkMismatch,
+  getCurrentOriginResult,
+  type OriginValidationResult,
+  type NetworkMismatchResult,
+  type SigningGuardResult,
+  type OriginDecision,
+} from "@/lib/signing-origin-validator";
 
 export function getExplorerTxUrl(txHash: string): string {
   const base = getNetworkConfig(getActiveNetwork()).explorerUrl;
@@ -537,7 +597,7 @@ export function parseContractError(error: unknown, currentBalance?: string): str
   }
 
   // ── Network / timeout errors ──────────────────────────────────────────────
-  if (lower.includes("timeout") || lower.includes("timed out")) {
+  if (lower.includes("timeout") || lower.includes("timed out") || lower.includes("504") || lower.includes("gateway") || lower.includes("abort")) {
     return "The transaction timed out. Please check your network connection and try again.";
   }
   if (lower.includes("econnrefused") || lower.includes("network") || lower.includes("fetch")) {

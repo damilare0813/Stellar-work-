@@ -17,20 +17,77 @@ import ErrorBoundary from "@/components/ErrorBoundary";
 import JsonLd from "@/components/JsonLd";
 import AppFooter from "@/components/AppFooter";
 import OfflineIndicator from "@/components/OfflineIndicator";
+import { PWAInstallPrompt } from "@/components/pwa-install-prompt";
 import WalletNetworkWarning from "@/components/WalletNetworkWarning";
 import DeferredClientFeatures from "@/components/DeferredClientFeatures";
-import { PWAInstallPrompt } from "@/components/pwa-install-prompt";
 import { ClientProviders } from "./client-providers";
 import "./globals.css";
+
+// ── Font loading strategy ────────────────────────────────────────────────────
+//
+// Geist Sans (primary text):
+//   display:"optional" — the browser uses the fallback on first visit when the
+//   font hasn't loaded within the very short optional period (≈100 ms). On all
+//   subsequent visits the woff2 is already in the HTTP cache and loads
+//   instantly with zero layout shift. This is the strongest available CLS
+//   guarantee; no reflow ever occurs.
+//
+//   adjustFontFallback:true — Next.js computes Geist's exact ascent, descent,
+//   line-gap, and advance-width metrics and emits a @font-face for the fallback
+//   that adjusts those values to match. This makes the fallback
+//   "size-adjusted": text occupies the same line boxes as the real font, so
+//   even when the font loads late it causes no measurable layout shift.
+//
+//   preload:true — emits a <link rel="preload" as="font"> in the document
+//   <head> so the woff2 is fetched at the highest priority and is usually
+//   already in-flight before the render tree is ready.
+//
+// Geist Mono (code / Stellar addresses):
+//   display:"swap" — monospace content is semantically tied to its exact
+//   character spacing, so a FOUT (flash of unstyled text) is preferable to
+//   showing a proportional system fallback for blockchain hashes/addresses.
+//   Users need to read or copy those strings immediately; the substitution
+//   would break the visual expectation even if it doesn't shift layout.
+//
+// Both fonts:
+//   subsets:["latin"] — only the Latin-1 Supplement subset is embedded. The
+//   Stellar UI deals exclusively with ASCII identifiers and English/Latin UI
+//   strings, so no other subsets are needed. Reducing the subset trims the
+//   woff2 payload by ~30–40 % compared to the full font file.
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],
+  display: "optional",
+  preload: true,
+  adjustFontFallback: true,
+  fallback: [
+    "system-ui",
+    "-apple-system",
+    "BlinkMacSystemFont",
+    "Segoe UI",
+    "Helvetica Neue",
+    "Arial",
+    "sans-serif",
+  ],
 });
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
+  display: "swap",
+  preload: true,
+  adjustFontFallback: true,
+  fallback: [
+    "ui-monospace",
+    "SFMono-Regular",
+    "Menlo",
+    "Monaco",
+    "Consolas",
+    "Liberation Mono",
+    "Courier New",
+    "monospace",
+  ],
 });
 
 export const viewport: Viewport = {
@@ -153,6 +210,7 @@ export default async function RootLayout({
                           <DeferredClientFeatures />
                           <ClientProviders>
                             <OfflineIndicator />
+                            <PWAInstallPrompt />
                             <WalletNetworkWarning />
                             <Navigation />
                             <ScrollRestorer />
@@ -175,45 +233,6 @@ export default async function RootLayout({
                                     </p>
                                   </div>
 
-        <ThemeProvider>
-        <TypographyProvider>
-        <NetworkProvider>
-        <WalletProvider>
-          <NotificationProvider>
-          <MessagingProvider>
-          <MeetingsProvider>
-          <ToastProvider>
-          <a
-            href="#main-content"
-            className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:bg-white focus:px-3 focus:py-2 focus:text-slate-900 focus:outline-none dark:focus:bg-slate-800 dark:focus:text-slate-100"
-          >
-            Skip to main content
-          </a>
-          <DeferredClientFeatures />
-          <ClientProviders>
-          <OfflineIndicator />
-          <PWAInstallPrompt />
-          <WalletNetworkWarning />
-          <Navigation />
-          <ScrollRestorer />
-          <main id="main-content" tabIndex={-1} className="mx-auto w-full max-w-5xl flex-1 px-3 py-6 sm:px-4 sm:py-8 lg:ml-[220px]">
-            <ErrorBoundary>{children}</ErrorBoundary>
-          </main>
-          <footer className="mt-auto border-t border-slate-200 bg-white py-8">
-            <div className="mx-auto max-w-5xl px-4">
-              <div className="flex flex-col items-center justify-between gap-6 md:flex-row">
-                <div className="flex flex-col items-center gap-2 md:items-start">
-                  <span className="text-lg font-bold text-slate-900">StellarWork</span>
-                  <p className="text-sm text-slate-500">Decentralized Escrow Marketplace</p>
-                </div>
-
-                <nav className="flex flex-wrap justify-center gap-8 text-sm font-medium text-slate-600">
-                  <a href="https://github.com/anumukul/Stellar-work-" target="_blank" rel="noopener noreferrer" className="hover:text-blue-600 transition-colors">GitHub</a>
-                  <Link href="/docs" className="hover:text-blue-600 transition-colors">Documentation</Link>
-                  <a href="/LICENSE" target="_blank" rel="noopener noreferrer" className="hover:text-blue-600 transition-colors">License</a>
-                  <Link href="/legal/terms" className="hover:text-blue-600 transition-colors">Terms</Link>
-                  <Link href="/legal/privacy" className="hover:text-blue-600 transition-colors">Privacy</Link>
-                </nav>
                                   <nav className="flex flex-wrap justify-center gap-8 text-sm font-medium text-slate-600 dark:text-slate-400">
                                     <a
                                       href="https://github.com/anumukul/Stellar-work-"

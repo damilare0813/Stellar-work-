@@ -11,6 +11,8 @@ import LoadingState from '../components/LoadingState';
 import NetworkBadge from '../components/NetworkBadge';
 import ErrorBanner from '../components/ErrorBanner';
 import StatusPill from '../components/StatusPill';
+import JobStatusTimeline from '../components/JobStatusTimeline';
+import MilestoneProgress from '../components/MilestoneProgress';
 
 /**
  * Accessibility test suite using axe-core via vitest-axe.
@@ -33,31 +35,31 @@ describe('Accessibility Tests', () => {
   it('Spinner has no accessibility violations', async () => {
     const { container } = render(<Spinner size="md" />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   it('LoadingState has no accessibility violations', async () => {
-    const { container } = render(<LoadingState />);
+    const { container } = render(<LoadingState text="Loading..." />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   it('EmptyState has no accessibility violations', async () => {
-    const { container } = render(<EmptyState message="No items found" />);
+    const { container } = render(<EmptyState title="No items found" description="No items found" />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   it('ErrorBanner has no accessibility violations', async () => {
     const { container } = render(<ErrorBanner message="Something went wrong" />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   it('StatusPill has no accessibility violations', async () => {
     const { container } = render(<StatusPill status="Open" />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   // ── Navigation / Layout ────────────────────────────────────────────
@@ -65,15 +67,15 @@ describe('Accessibility Tests', () => {
   it('AppFooter has no accessibility violations', async () => {
     const { container } = render(<AppFooter />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   // ── Stellar-specific ──────────────────────────────────────────────
 
   it('NetworkBadge has no accessibility violations', async () => {
-    const { container } = render(<NetworkBadge network="testnet" />);
+    const { container } = render(<NetworkBadge />);
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 });
 
@@ -86,17 +88,62 @@ describe('Accessibility Tests', () => {
  */
 describe('Stellar-Specific Accessibility Patterns', () => {
   it('NetworkBadge conveys network info without relying solely on color', async () => {
-    const { container } = render(<NetworkBadge network="testnet" />);
+    const { container } = render(<NetworkBadge />);
     // The badge must include text content, not just a colored dot
     expect(container.textContent).toBeTruthy();
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
   });
 
   it('StatusPill conveys status without relying solely on color', async () => {
     const { container } = render(<StatusPill status="Completed" />);
     expect(container.textContent).toBeTruthy();
     const results = await axe(container);
-    expect(results).toHaveNoViolations();
+    expect(results.violations).toEqual([]);
+  });
+
+  it('JobStatusTimeline has accessible name and steps order', async () => {
+    const sampleJob = {
+      client: "GXXXX",
+      freelancer: null,
+      amount: "10000000",
+      description_hash: "abc",
+      status: "InProgress" as const,
+      created_at: "1710000000",
+      deadline: "0",
+      token: "CAS3",
+      revision_count: 0,
+      submitted_at: "0",
+    };
+    const { getByRole, getAllByRole, container } = render(<JobStatusTimeline job={sampleJob} />);
+    expect(getByRole("region", { name: /Job status timeline/i })).toBeInDOM();
+    const steps = getAllByRole("listitem");
+    expect(steps.length).toBeGreaterThan(0);
+    const results = await axe(container);
+    expect(results.violations).toEqual([]);
+  });
+
+  it('MilestoneProgress has accessible progressbar and live region', async () => {
+    const mockMilestones = [
+      { id: 0, description_hash: "hash1", amount: "50000000", is_released: true },
+      { id: 1, description_hash: "hash2", amount: "50000000", is_released: false },
+    ];
+    const { getByRole, container } = render(
+      <MilestoneProgress
+        jobId="1"
+        milestones={mockMilestones}
+        wallet="GXXXX"
+        isInProgress={true}
+        onMilestoneApproved={() => {}}
+        onError={() => {}}
+        actionLoading={false}
+        setActionLoading={() => {}}
+      />
+    );
+    const progressbar = getByRole("progressbar");
+    expect(progressbar).toHaveAttribute("aria-valuenow", "50");
+    expect(progressbar).toHaveAttribute("aria-valuetext", "1 of 2 milestones released (50%)");
+    const results = await axe(container);
+    expect(results.violations).toEqual([]);
   });
 });

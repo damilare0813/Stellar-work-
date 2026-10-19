@@ -1,6 +1,47 @@
 #![cfg(test)]
+mod bonus_test;
 use super::*;
 use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, vec, IntoVal};
+
+/// Data integrity helper for state transition validation
+/// Captures ledger state before and after transitions to verify balance conservation
+struct StateSnapshot {
+    client_balance: i128,
+    freelancer_balance: i128,
+    contract_balance: i128,
+    fees: i128,
+    job_count: u64,
+    completed_count: u64,
+    cancelled_count: u64,
+}
+
+fn capture_state(
+    env: &Env,
+    escrow: &EscrowContractClient,
+    token: &Address,
+    contract_id: &Address,
+    client: &Address,
+    freelancer: &Address,
+) -> StateSnapshot {
+    let token_client = soroban_sdk::token::StellarAssetClient::new(env, token);
+    StateSnapshot {
+        client_balance: token_client.balance(client),
+        freelancer_balance: token_client.balance(freelancer),
+        contract_balance: token_client.balance(contract_id),
+        fees: escrow.get_fees(token),
+        job_count: escrow.get_job_count(),
+        completed_count: escrow.get_completed_jobs_count(),
+        cancelled_count: escrow.get_cancelled_jobs_count(),
+    }
+}
+
+/// Asserts that token balances are conserved (sum of all balances remains constant)
+fn assert_balance_conservation(pre: &StateSnapshot, post: &StateSnapshot, fee_expected: i128) {
+    let pre_total = pre.client_balance + pre.freelancer_balance + pre.contract_balance;
+    let post_total = post.client_balance + post.freelancer_balance + post.contract_balance;
+    // Total should decrease by the fee amount (fees are still in contract balance)
+    assert_eq!(pre_total - post_total, fee_expected, "Balance conservation violated");
+}
 
 #[allow(deprecated)]
 fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address) {
@@ -2459,8 +2500,228 @@ fn test_multiple_certificates_across_jobs() {
     }
 
     assert_eq!(escrow.get_certificate_count(&freelancer), 3);
-    let certs = escrow.get_certificates(&freelancer, &0u64, &10u64);
-    assert_eq!(certs.len(), 3);
+}
+
+// ============================================================================
+// DATA INTEGRITY TESTS - State Transition Validation
+// See: contracts/escrow/STATE_TRANSITION_QA_CHECKLIST.md
+// ============================================================================
+
+#[test]
+fn test_post_job_data_integrity() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline: u64 = 1000;
+    let amount: i128 = 100_0000000;
+
+    // Capture pre-state
+    let pre = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Execute transition
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token, &dummy_title(&env), &dummy_category(&env));
+
+    // Capture post-state
+    let post = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Validate post-state
+    assert_eq!(post.job_count, pre.job_count + 1, "Job count should increment");
+    assert_eq!(post.client_balance, pre.client_balance - amount, "Client balance should decrease by amount");
+    assert_eq!(post.contract_balance, pre.contract_balance + amount, "Contract balance should increase by amount");
+    assert_eq!(post.fees, pre.fees, "Fees should be unchanged");
+    assert_balance_conservation(&pre, &post, 0);
+
+    // Validate job state
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Open, "Status should be Open");
+    assert_eq!(job.amount, amount, "Amount should match");
+    assert_eq!(job.client, client, "Client should match");
+    assert!(job.freelancer.is_none(), "Freelancer should be None");
+    assert_eq!(job.revision_count, 0, "Revision count should be 0");
+}
+
+#[test]
+fn test_approve_work_data_integrity() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline: u64 = 1000;
+    let amount: i128 = 100_0000000;
+
+    // Setup job through submission
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token, &dummy_title(&env), &dummy_category(&env));
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.submit_work(&freelancer, &job_id);
+
+    // Capture pre-state
+    let pre = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+    let fee_bps = escrow.get_fee_bps();
+
+    // Execute transition
+    escrow.approve_work(&client, &job_id);
+
+    // Capture post-state
+    let post = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Calculate expected values
+    let expected_fee = amount * fee_bps / 10_000;
+    let expected_payout = amount - expected_fee;
+
+    // Validate post-state
+    assert_eq!(post.completed_count, pre.completed_count + 1, "Completed count should increment");
+    assert_eq!(post.freelancer_balance, pre.freelancer_balance + expected_payout, "Freelancer should receive payout");
+    assert_eq!(post.fees, pre.fees + expected_fee, "Fees should be collected");
+    assert_eq!(post.contract_balance, pre.contract_balance - amount, "Contract escrow should decrease by amount");
+    assert_balance_conservation(&pre, &post, expected_fee);
+
+    // Validate job state
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed, "Status should be Completed");
+}
+
+#[test]
+fn test_cancel_job_data_integrity() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline: u64 = 1000;
+    let amount: i128 = 100_0000000;
+
+    // Setup job
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token, &dummy_title(&env), &dummy_category(&env));
+
+    // Capture pre-state
+    let pre = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Execute transition
+    escrow.cancel_job(&client, &job_id);
+
+    // Capture post-state
+    let post = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Validate post-state
+    assert_eq!(post.cancelled_count, pre.cancelled_count + 1, "Cancelled count should increment");
+    assert_eq!(post.client_balance, pre.client_balance + amount, "Client should be refunded");
+    assert_eq!(post.contract_balance, pre.contract_balance - amount, "Contract escrow should decrease");
+    assert_eq!(post.fees, pre.fees, "Fees should be unchanged");
+    assert_balance_conservation(&pre, &post, 0);
+
+    // Validate job state
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Cancelled, "Status should be Cancelled");
+}
+
+#[test]
+fn test_resolve_dispute_full_refund_data_integrity() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline: u64 = 1000;
+    let amount: i128 = 100_0000000;
+
+    // Setup disputed job
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token, &dummy_title(&env), &dummy_category(&env));
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.raise_dispute(&client, &job_id);
+
+    // Capture pre-state
+    let pre = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Execute transition - full refund to client (client_bps = 10,000)
+    let resolution = DisputeResolution { client_bps: 10_000 };
+    escrow.resolve_dispute(&admin, &job_id, &resolution);
+
+    // Capture post-state
+    let post = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Validate post-state - full refund, no fee
+    assert_eq!(post.client_balance, pre.client_balance + amount, "Client should receive full refund");
+    assert_eq!(post.contract_balance, pre.contract_balance - amount, "Contract escrow should decrease");
+    assert_eq!(post.fees, pre.fees, "No fee should be collected for full refund");
+    assert_balance_conservation(&pre, &post, 0);
+
+    // Validate job state
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Cancelled, "Status should be Cancelled for full refund");
+}
+
+#[test]
+fn test_resolve_dispute_split_data_integrity() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline: u64 = 1000;
+    let amount: i128 = 100_0000000;
+
+    // Setup disputed job
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token, &dummy_title(&env), &dummy_category(&env));
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.raise_dispute(&client, &job_id);
+
+    // Capture pre-state
+    let pre = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+    let fee_bps = escrow.get_fee_bps();
+
+    // Execute transition - 50/50 split (client_bps = 5,000)
+    let client_bps = 5_000i128;
+    let resolution = DisputeResolution { client_bps };
+    escrow.resolve_dispute(&admin, &job_id, &resolution);
+
+    // Capture post-state
+    let post = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Calculate expected values
+    let client_share = amount * client_bps / 10_000;
+    let freelancer_share = amount - client_share;
+    let expected_fee = freelancer_share * fee_bps / 10_000;
+
+    // Validate post-state
+    assert_eq!(post.client_balance, pre.client_balance + client_share, "Client should receive their share");
+    assert_eq!(post.freelancer_balance, pre.freelancer_balance + freelancer_share - expected_fee, "Freelancer should receive share minus fee");
+    assert_eq!(post.fees, pre.fees + expected_fee, "Fee should be collected on freelancer portion");
+    assert_eq!(post.contract_balance, pre.contract_balance - amount, "Contract escrow should decrease");
+    assert_balance_conservation(&pre, &post, expected_fee);
+
+    // Validate job state
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Cancelled, "Status should be Cancelled for split resolution");
+}
+
+#[test]
+fn test_full_lifecycle_data_integrity() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline: u64 = 1000;
+    let amount: i128 = 100_0000000;
+
+    // Capture initial state
+    let initial = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+
+    // Full lifecycle: post -> accept -> submit -> approve
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token, &dummy_title(&env), &dummy_category(&env));
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.submit_work(&freelancer, &job_id);
+    escrow.approve_work(&client, &job_id);
+
+    // Capture final state
+    let final_state = capture_state(&env, &escrow, &token, &contract_id, &client, &freelancer);
+    let fee_bps = escrow.get_fee_bps();
+    let expected_fee = amount * fee_bps / 10_000;
+
+    // Validate overall integrity
+    assert_eq!(final_state.job_count, initial.job_count + 1, "One job created");
+    assert_eq!(final_state.completed_count, initial.completed_count + 1, "One job completed");
+    assert_eq!(final_state.client_balance, initial.client_balance - amount, "Client paid amount");
+    assert_eq!(final_state.freelancer_balance, initial.freelancer_balance + amount - expected_fee, "Freelancer received payout minus fee");
+    assert_eq!(final_state.fees, initial.fees + expected_fee, "Fees collected");
+    assert_eq!(final_state.contract_balance, initial.contract_balance, "Contract escrow returned to initial (amount in, payout+fees out)");
 }
 
 #[test]
@@ -2487,4 +2748,213 @@ fn test_get_certificates_pagination() {
 
     let page3 = escrow.get_certificates(&freelancer, &4u64, &2u64);
     assert_eq!(page3.len(), 1);
+}
+
+#[test]
+fn test_two_step_admin_ownership_handover() {
+    let env = Env::default();
+    let (admin, _client, _freelancer, _token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let new_admin = Address::generate(&env);
+
+    // Step 1: nomination leaves the active admin in place.
+    escrow.transfer_ownership(&admin, &new_admin);
+    assert_eq!(escrow.get_admin(), admin, "Active admin must not change before accept");
+    assert_eq!(escrow.get_pending_admin(), Some(new_admin.clone()), "Pending admin must be readable while in flight");
+
+    // Step 2: only the nominee can complete the handover.
+    escrow.accept_ownership(&new_admin);
+    assert_eq!(escrow.get_admin(), new_admin, "Pending admin becomes active");
+    assert_eq!(escrow.get_pending_admin(), None, "Pending admin cleared after accept");
+
+    // A completed handover cannot be replayed, and the old admin loses access.
+    assert!(escrow.try_accept_ownership(&admin).is_err(), "Old admin cannot accept a second time");
+    assert!(escrow.try_set_required_approvals(&admin, &1u32).is_err(), "Old admin lost access");
+}
+
+// ── [SC-159] Dispute cooldown period tests ────────────────────────────────────
+//
+// Verifies the configurable cooldown window that must elapse after a dispute
+// is resolved before the same job can be disputed again.
+
+/// SC-159-01: Admin can set and read the dispute cooldown window.
+#[test]
+fn test_set_and_get_dispute_cooldown() {
+    let env = Env::default();
+    let (admin, _client, _freelancer, _token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+
+    // Default cooldown is 0 (disabled).
+    assert_eq!(escrow.get_dispute_cooldown_ledgers(), 0);
+
+    escrow.set_dispute_cooldown(&admin, &100u32);
+    assert_eq!(escrow.get_dispute_cooldown_ledgers(), 100);
+}
+
+/// SC-159-02: Admin setter rejects a cooldown above the maximum bound.
+#[test]
+#[should_panic]
+fn test_set_dispute_cooldown_above_max_panics() {
+    let env = Env::default();
+    let (admin, _client, _freelancer, _token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+
+    // MAX_DISPUTE_COOLDOWN_LEDGERS + 1 must be rejected.
+    escrow.set_dispute_cooldown(&admin, &(MAX_DISPUTE_COOLDOWN_LEDGERS + 1));
+}
+
+/// SC-159-03: Non-admin cannot change the dispute cooldown.
+#[test]
+#[should_panic]
+fn test_set_dispute_cooldown_unauthorized_panics() {
+    let env = Env::default();
+    let (_admin, client, _freelancer, _token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+
+    escrow.set_dispute_cooldown(&client, &50u32);
+}
+
+/// SC-159-04: Re-disputing before the cooldown elapses is blocked.
+#[test]
+fn test_raise_dispute_blocked_during_cooldown() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let deadline: u64 = 10_000;
+    let amount: i128 = 100_0000000;
+
+    escrow.set_dispute_cooldown(&admin, &100u32);
+
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token);
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.raise_dispute(&client, &job_id);
+    escrow.resolve_dispute(&admin, &job_id, &client);
+
+    // Advance partway into the cooldown window.
+    let resolved_at = env.ledger().sequence();
+    env.ledger().set_sequence_number(resolved_at + 50);
+
+    // Remaining cooldown must be positive.
+    let remaining = escrow.get_dispute_cooldown_remaining(&job_id);
+    assert!(remaining > 0, "cooldown should still be active");
+
+    // Attempting to re-dispute must panic with DisputeCooldownActive.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        escrow.raise_dispute(&client, &job_id);
+    }));
+    assert!(result.is_err(), "raise_dispute must be blocked during cooldown");
+}
+
+/// SC-159-05: Boundary — re-disputing at exactly the cooldown boundary succeeds.
+#[test]
+fn test_raise_dispute_allowed_at_exact_cooldown_boundary() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let deadline: u64 = 10_000;
+    let amount: i128 = 100_0000000;
+
+    let cooldown: u32 = 100;
+    escrow.set_dispute_cooldown(&admin, &cooldown);
+
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token);
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.raise_dispute(&client, &job_id);
+    escrow.resolve_dispute(&admin, &job_id, &client);
+
+    let resolved_at = env.ledger().sequence();
+    // Advance to exactly the cooldown boundary.
+    env.ledger().set_sequence_number(resolved_at + cooldown);
+
+    // Remaining cooldown must be zero at the boundary.
+    assert_eq!(escrow.get_dispute_cooldown_remaining(&job_id), 0);
+
+    // Re-dispute must succeed at the exact boundary.
+    escrow.raise_dispute(&client, &job_id);
+    assert_eq!(escrow.get_job(&job_id).status, JobStatus::Disputed);
+}
+
+/// SC-159-06: Disabled cooldown (0) allows immediate re-dispute.
+#[test]
+fn test_raise_dispute_allowed_when_cooldown_disabled() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let deadline: u64 = 10_000;
+    let amount: i128 = 100_0000000;
+
+    // Cooldown defaults to 0 (disabled).
+    assert_eq!(escrow.get_dispute_cooldown_ledgers(), 0);
+
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token);
+    escrow.accept_job(&freelancer, &job_id);
+    escrow.raise_dispute(&client, &job_id);
+    escrow.resolve_dispute(&admin, &job_id, &client);
+
+    // No ledger advance needed — re-dispute must succeed immediately.
+    assert_eq!(escrow.get_dispute_cooldown_remaining(&job_id), 0);
+    escrow.raise_dispute(&client, &job_id);
+    assert_eq!(escrow.get_job(&job_id).status, JobStatus::Disputed);
+}
+
+/// SC-159-07: get_dispute_cooldown_remaining returns 0 for a never-disputed job.
+#[test]
+fn test_get_dispute_cooldown_remaining_never_disputed() {
+    let env = Env::default();
+    let (admin, client, _freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let deadline: u64 = 10_000;
+    let amount: i128 = 100_0000000;
+
+    escrow.set_dispute_cooldown(&admin, &100u32);
+
+    let job_id = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token);
+    // Job has never been disputed → no cooldown active.
+    assert_eq!(escrow.get_dispute_cooldown_remaining(&job_id), 0);
+}
+
+/// SC-159-08: Admin update emits DisputeCooldownUpdated event.
+#[test]
+fn test_set_dispute_cooldown_emits_event() {
+    let env = Env::default();
+    let (admin, _client, _freelancer, _token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+
+    let pre_events = env.events().all().len();
+    escrow.set_dispute_cooldown(&admin, &250u32);
+    let post_events = env.events().all().len();
+
+    assert!(
+        post_events > pre_events,
+        "setting the dispute cooldown must emit an event"
+    );
+}
+
+/// SC-159-09: Cooldown is per-job and does not affect other jobs.
+#[test]
+fn test_dispute_cooldown_is_per_job() {
+    let env = Env::default();
+    let (admin, client, freelancer, token, contract_id) = setup_test(&env);
+    let escrow = new_escrow(&env, &contract_id);
+    let desc_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let deadline: u64 = 10_000;
+    let amount: i128 = 100_0000000;
+
+    escrow.set_dispute_cooldown(&admin, &100u32);
+
+    let job1 = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token);
+    escrow.accept_job(&freelancer, &job1);
+    escrow.raise_dispute(&client, &job1);
+    escrow.resolve_dispute(&admin, &job1, &client);
+
+    // A second, unrelated job must not be affected by job1's cooldown.
+    let job2 = escrow.post_job(&client, &amount, &desc_hash, &100u32, &deadline, &token);
+    escrow.accept_job(&freelancer, &job2);
+    assert_eq!(escrow.get_dispute_cooldown_remaining(&job2), 0);
+    escrow.raise_dispute(&client, &job2);
+    assert_eq!(escrow.get_job(&job2).status, JobStatus::Disputed);
 }

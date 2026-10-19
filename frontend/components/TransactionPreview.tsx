@@ -2,9 +2,68 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Spinner from "@/components/Spinner";
+import { computeFeeRatio, type FeeEstimate } from "@/lib/fee-estimator";
+import { feeToXlm } from "@/lib/horizon-transactions";
+
+/**
+ * Map a `FeeEstimate` from `lib/fee-estimator` into this component's display
+ * shape (XLM + USD, base/computation breakdown, recent-fee comparison and the
+ * high-fee warning).
+ */
+export function feeEstimateToSimulation(estimate: FeeEstimate): SimulationResult {
+  const { breakdown } = estimate;
+  return {
+    fee: estimate.feeXlm,
+    feeUsd: estimate.feeUsd ?? undefined,
+    feeBreakdown: {
+      baseFeeXlm: feeToXlm(breakdown.baseFeeStroops.toString()),
+      computationFeeXlm: feeToXlm(breakdown.resourceFeeStroops.toString()),
+      totalFeeXlm: feeToXlm(breakdown.totalFeeStroops.toString()),
+    },
+    recentComparison: estimate.recentComparison
+      ? {
+          count: estimate.recentComparison.count,
+          averageFeeXlm: feeToXlm(estimate.recentComparison.averageFeeStroops.toString()),
+          ratioToAverage: computeFeeRatio(
+            breakdown.totalFeeStroops,
+            estimate.recentComparison,
+          ),
+        }
+      : null,
+    highFeeWarning: estimate.highFeeWarning,
+    stateChanges: [],
+    simulatedAt: estimate.simulatedAt,
+  };
+}
+
+export interface FeeBreakdownDisplay {
+  /** Classic base fee in XLM (e.g. "0.0000100"). */
+  baseFeeXlm: string;
+  /** Soroban computation fee in XLM (e.g. "0.0011900"). */
+  computationFeeXlm: string;
+  /** Total in XLM. */
+  totalFeeXlm: string;
+}
+
+export interface RecentFeeComparisonDisplay {
+  /** Number of recent transactions used for the comparison. */
+  count: number;
+  /** Average fee of those transactions in XLM. */
+  averageFeeXlm: string;
+  /** Estimate relative to the average: 1 = same, 1.5 = 50% higher. */
+  ratioToAverage: number | null;
+}
 
 export interface SimulationResult {
   fee: string;
+  /** Estimated fee in fiat (e.g. "$0.31"), when exchange rates are available. */
+  feeUsd?: string;
+  /** Optional fee breakdown (base + computation). */
+  feeBreakdown?: FeeBreakdownDisplay | null;
+  /** Comparison against the wallet's recent on-chain fees. */
+  recentComparison?: RecentFeeComparisonDisplay | null;
+  /** Set when the estimate is unusually high. */
+  highFeeWarning?: string | null;
   stateChanges: string[];
   balanceBefore?: string;
   balanceAfter?: string;
@@ -19,7 +78,42 @@ export interface TransactionPreviewProps {
   simulation: SimulationResult | null;
   simulating: boolean;
   simulationError?: string;
+  /**
+   * When true, the "Confirm is disabled until simulation succeeds" note is
+   * hidden — the caller still allows submission even if the estimate failed.
+   */
+  allowSubmitWithoutSimulation?: boolean;
   onReSimulate?: () => void;
+  /**
+   * Explicit payload scope shown as a labelled summary above the fee section.
+   * Lets users see exactly what they are signing (job, amount, recipient)
+   * before they hit Confirm. All fields are optional — only provided ones
+   * render.
+   */
+  payloadScope?: PayloadScope | null;
+}
+
+/**
+ * Human-readable summary of what a signing request will commit.
+ * Displayed inside TransactionPreview so users can verify the scope
+ * (job title, token amount, recipient address, deadline) before confirming.
+ */
+export interface PayloadScope {
+  /** Short name of the operation, e.g. "Post job", "Accept job". */
+  operation: string;
+  /** Amount of tokens being escrowed or transferred, with symbol (e.g. "10 XLM"). */
+  amount?: string;
+  /**
+   * Recipient address or identifier. For `post_job` this is the client
+   * address; for `approve_work` it is the freelancer; omit when not relevant.
+   */
+  recipient?: string;
+  /** Deadline date as a locale string, e.g. "2026-12-01". */
+  deadline?: string;
+  /** Job title or other identifying label for the scope. */
+  jobTitle?: string;
+  /** Contract method being invoked (e.g. "post_job"). */
+  contractMethod?: string;
 }
 
 const STALE_THRESHOLD_MS = 30_000;
@@ -30,7 +124,9 @@ export default function TransactionPreview({
   simulation,
   simulating,
   simulationError,
+  allowSubmitWithoutSimulation = false,
   onReSimulate,
+  payloadScope,
 }: TransactionPreviewProps) {
   const [showRaw, setShowRaw] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -72,6 +168,59 @@ export default function TransactionPreview({
         <p className="text-slate-600">{details}</p>
       </div>
 
+      {/* ── Payload scope summary ──────────────────────────────────────────
+           Shows the exact fields being committed so the user can verify
+           what they are signing before the wallet prompt appears.
+      ─────────────────────────────────────────────────────────────────── */}
+      {payloadScope && (
+        <div
+          className="mt-3 rounded-md bg-white px-3 py-2 ring-1 ring-inset ring-slate-200"
+          aria-label="Signing payload scope"
+        >
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            What you are signing
+          </p>
+          <dl className="space-y-1 text-sm">
+            {payloadScope.jobTitle && (
+              <div className="flex items-start justify-between gap-4">
+                <dt className="shrink-0 text-slate-500">Job</dt>
+                <dd className="text-right font-medium text-slate-800 break-words max-w-[60%]">
+                  {payloadScope.jobTitle}
+                </dd>
+              </div>
+            )}
+            {payloadScope.contractMethod && (
+              <div className="flex items-start justify-between gap-4">
+                <dt className="shrink-0 text-slate-500">Contract method</dt>
+                <dd className="font-mono text-right text-slate-700">
+                  {payloadScope.contractMethod}
+                </dd>
+              </div>
+            )}
+            {payloadScope.amount && (
+              <div className="flex items-start justify-between gap-4">
+                <dt className="shrink-0 text-slate-500">Amount</dt>
+                <dd className="font-medium text-slate-800">{payloadScope.amount}</dd>
+              </div>
+            )}
+            {payloadScope.recipient && (
+              <div className="flex items-start justify-between gap-4">
+                <dt className="shrink-0 text-slate-500">Recipient</dt>
+                <dd className="break-all font-mono text-right text-xs text-slate-700">
+                  {payloadScope.recipient}
+                </dd>
+              </div>
+            )}
+            {payloadScope.deadline && (
+              <div className="flex items-start justify-between gap-4">
+                <dt className="shrink-0 text-slate-500">Deadline</dt>
+                <dd className="text-slate-800">{payloadScope.deadline}</dd>
+              </div>
+            )}
+          </dl>
+        </div>
+      )}
+
       {simulationError && (
         <div className="mt-3 rounded-md bg-red-50 p-3 text-red-700 ring-1 ring-inset ring-red-200">
           <p className="font-medium">Simulation failed</p>
@@ -83,8 +232,70 @@ export default function TransactionPreview({
         <div className="mt-3 space-y-2">
           <div className="flex items-center justify-between rounded-md bg-white px-3 py-2 ring-1 ring-inset ring-slate-200">
             <span className="text-slate-600">Estimated fee</span>
-            <span className="font-medium text-slate-900">{simulation.fee} XLM</span>
+            <span className="font-medium text-slate-900">
+              {simulation.fee} XLM
+              {simulation.feeUsd && (
+                <span className="ml-1 font-normal text-slate-500">
+                  (~{simulation.feeUsd})
+                </span>
+              )}
+            </span>
           </div>
+
+          {simulation.feeBreakdown && (
+            <div className="rounded-md bg-white px-3 py-2 ring-1 ring-inset ring-slate-200">
+              <p className="mb-1 text-slate-600">Fee breakdown</p>
+              <dl className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <dt className="text-slate-600">Base fee</dt>
+                  <dd className="font-medium text-slate-800">
+                    {simulation.feeBreakdown.baseFeeXlm} XLM
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <dt className="text-slate-600">Computation fee</dt>
+                  <dd className="font-medium text-slate-800">
+                    {simulation.feeBreakdown.computationFeeXlm} XLM
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between border-t border-slate-100 pt-1">
+                  <dt className="font-medium text-slate-700">Total</dt>
+                  <dd className="font-semibold text-slate-900">
+                    {simulation.feeBreakdown.totalFeeXlm} XLM
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          )}
+
+          {simulation.recentComparison && (
+            <div className="flex items-center justify-between rounded-md bg-white px-3 py-2 ring-1 ring-inset ring-slate-200">
+              <span className="text-slate-600">
+                vs. {simulation.recentComparison.count} recent{" "}
+                {simulation.recentComparison.count === 1 ? "transaction" : "transactions"}{" "}
+                (avg {simulation.recentComparison.averageFeeXlm} XLM)
+              </span>
+              <span className="font-medium text-slate-900">
+                {simulation.recentComparison.ratioToAverage == null
+                  ? "—"
+                  : simulation.recentComparison.ratioToAverage > 1
+                    ? `+${Math.round((simulation.recentComparison.ratioToAverage - 1) * 100)}% vs avg`
+                    : simulation.recentComparison.ratioToAverage < 1
+                      ? `${Math.round((simulation.recentComparison.ratioToAverage - 1) * 100)}% vs avg`
+                      : "matches avg"}
+              </span>
+            </div>
+          )}
+
+          {simulation.highFeeWarning && (
+            <div
+              className="rounded-md bg-amber-50 p-3 text-amber-800 ring-1 ring-inset ring-amber-200"
+              role="alert"
+            >
+              <p className="font-medium">Unusually high fee estimate</p>
+              <p className="mt-1 text-xs">{simulation.highFeeWarning}</p>
+            </div>
+          )}
 
           {simulation.stateChanges.length > 0 && (
             <div className="rounded-md bg-white px-3 py-2 ring-1 ring-inset ring-slate-200">
@@ -146,7 +357,7 @@ export default function TransactionPreview({
         </div>
       )}
 
-      {hasError && (
+      {hasError && !allowSubmitWithoutSimulation && (
         <p className="mt-2 text-xs text-red-600">
           Confirm is disabled until simulation succeeds.
         </p>
